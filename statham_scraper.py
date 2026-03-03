@@ -111,10 +111,7 @@ def scrape_vk():
         
     vk_version = '5.131'
     # Список коротких имен пабликов (можно дополнять)
-    # 1. pacan_citaty_statham
-    # 2. statham_quote
-    # 3. statham.quotes
-    domains = ['statham_quote', 'statham.quotes', 'statham_says']
+    domains = ['jason_statham46', 'public96954008', 'jason_stathams']
     
     for domain in domains:
         print(f"Запрос постов из {domain}...")
