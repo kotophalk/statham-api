@@ -2,6 +2,7 @@ import urllib.request
 import json
 import time
 import re
+import os
 
 # Настройки
 HEADERS = {
@@ -9,8 +10,30 @@ HEADERS = {
 }
 OUTPUT_FILE = 'statham_quotes.json'
 
+# Попытка загрузить переменные из .env (ручной парсер, чтобы не зависеть от dotenv)
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(env_path):
+    with open(env_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, val = line.split('=', 1)
+                os.environ[key.strip()] = val.strip().strip("'\"")
+
 # Список собранных цитат
 quotes_collection = set()
+
+# При запуске скрипта сначала загружаем старые цитаты, чтобы не потерять их
+def load_existing():
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for item in data:
+                    quotes_collection.add(item['text'])
+            print(f"Загружено {len(quotes_collection)} существующих цитат из {OUTPUT_FILE}")
+        except Exception as e:
+            print(f"Ошибка при чтении существующего файла: {e}")
 
 def clean_quote(text):
     """Очистка текста от мусора и лишних пробелов"""
@@ -78,6 +101,57 @@ def scrape_reddit_json():
     except Exception as e:
         print(f"Ошибка при парсинге Reddit: {e}")
 
+def scrape_vk():
+    """Парсинг ВКонтакте по API"""
+    print("Парсинг VK...")
+    vk_token = os.environ.get('VK_TOKEN')
+    if not vk_token:
+        print("ВНИМАНИЕ: VK_TOKEN не найден в переменных окружения или .env файле. Пропускаем VK.")
+        return
+        
+    vk_version = '5.131'
+    # Список коротких имен пабликов (можно дополнять)
+    # 1. pacan_citaty_statham
+    # 2. statham_quote
+    # 3. statham.quotes
+    domains = ['statham_quote', 'statham.quotes', 'statham_says']
+    
+    for domain in domains:
+        print(f"Запрос постов из {domain}...")
+        # count=100 - максимум за 1 запрос к API
+        url = f"https://api.vk.com/method/wall.get?domain={domain}&count=100&v={vk_version}&access_token={vk_token}"
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                
+            if 'error' in data:
+                print(f"VK API Ошибка ({domain}): {data['error'].get('error_msg')}")
+                continue
+                
+            items = data.get('response', {}).get('items', [])
+            added_count = 0
+            for item in items:
+                text = item.get('text', '')
+                if not text:
+                    continue
+                # Разбиваем пост на строки, так как в одном посте может быть несколько мыслей, 
+                # либо мусор внизу
+                for line in text.split('\n'):
+                    cleaned = clean_quote(line)
+                    # Фильтруем ссылки, хэштеги и мусор
+                    if (10 < len(cleaned) < 200 and 
+                        "http" not in cleaned and 
+                        "vk.com" not in cleaned and 
+                        "#" not in cleaned and
+                        not cleaned.startswith('[')):
+                        quotes_collection.add(cleaned)
+                        added_count += 1
+            print(f"Из {domain} успешно обработано постов. Найдено потенциальных цитат: {added_count}")
+            time.sleep(1.5) # Задержка между запросами по лимитам ВК (3 запроса в секунду макс)
+        except Exception as e:
+            print(f"Ошибка при парсинге VK ({domain}): {e}")
+
 def save_to_json():
     """Сохранение результатов в JSON файл"""
     result_list = []
@@ -94,13 +168,17 @@ def save_to_json():
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(result_list, f, ensure_ascii=False, indent=4)
     
-    print(f"\nУспешно собрано {len(result_list)} уникальных цитат.")
+    print(f"\nУспешно собрано {len(result_list)} уникальных цитат (с учетом старых и новых).")
     print(f"Данные сохранены в файл: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     print("Запуск комбайна по сбору цитат...")
+    load_existing()
     scrape_citaty_info()
     time.sleep(1)
     scrape_reddit_json()
+    time.sleep(1)
+    scrape_vk()
+    
     save_to_json()
     print("Готово!")
