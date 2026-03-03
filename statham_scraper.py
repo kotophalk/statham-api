@@ -1,16 +1,15 @@
 import urllib.request
+import urllib.parse
 import json
 import time
 import re
 import os
 
-# Настройки
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
 }
 OUTPUT_FILE = 'statham_quotes.json'
 
-# Попытка загрузить переменные из .env (ручной парсер, чтобы не зависеть от dotenv)
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(env_path):
     with open(env_path, 'r', encoding='utf-8') as f:
@@ -20,10 +19,8 @@ if os.path.exists(env_path):
                 key, val = line.split('=', 1)
                 os.environ[key.strip()] = val.strip().strip("'\"")
 
-# Список собранных цитат
 quotes_collection = set()
 
-# При запуске скрипта сначала загружаем старые цитаты, чтобы не потерять их
 def load_existing():
     if os.path.exists(OUTPUT_FILE):
         try:
@@ -35,88 +32,133 @@ def load_existing():
         except Exception as e:
             print(f"Ошибка при чтении существующего файла: {e}")
 
+def is_statham_quote(text):
+    """Строгая проверка на наличие упоминания Стетхема в тексте поста/статьи"""
+    pattern = r'(?i)(стетхем|стэтхэм|стэйтем|стетхэм|statham|джейсон)'
+    return bool(re.search(pattern, text))
+
 def clean_quote(text):
-    """Очистка текста от мусора и лишних пробелов"""
+    """Очистка текста: удаление мусора, подписей и тегов"""
     text = text.strip()
-    # Убираем кавычки по краям если они есть
-    text = re.sub(r'^["«»\']+|["«»\']+$', '', text)
-    # Убираем (с) Стэтхем и подобное
-    text = re.sub(r'(?i)\(?\s*[cс]\s*\)?\s*ст[эе]тх[эе]м.*', '', text)
-    text = re.sub(r'(?i)-\s*Джейсон.*', '', text)
-    # Убираем html теги если зацепили
+    
+    # Сначала убираем html теги и декодируем сущности
     text = re.sub(r'<[^>]+>', '', text)
-    # Декодируем html сущности простейшие
-    text = text.replace('&quot;', '"').replace('&#x27;', "'").replace('&amp;', '&')
+    text = text.replace('&quot;', '"').replace('&#x27;', "'").replace('&amp;', '&').replace('&nbsp;', ' ')
+    
+    # Убираем подписи, которые обычно идут в конце (с дефисом, тире, копирайтом)
+    text = re.sub(r'(?i)[\n\r—\-~—]?\s*\(?[cс©]\)?\s*(джейсон\s+)?(ст[эе]тх[эе]м|стэйтем|statham).*$', '', text)
+    text = re.sub(r'(?i)[\n\r—\-~—]?\s*(джейсон\s+)?(ст[эе]тх[эе]м|стэйтем|statham).*$', '', text)
+    text = re.sub(r'(?i)^\s*\[?[cс©]\]?\s*(джейсон\s+)?(ст[эе]тх[эе]м|стэйтем|statham)[\]:]?\s*', '', text)
+    
+    # Убираем кавычки по краям
+    text = re.sub(r'^["«»\']+|["«»\']+$', '', text.strip())
+    
+    # Для текстовых мемов: очищаем блоки типа "[Описание: ...]" 
+    text = re.sub(r'(?i)\[описание:.*?\]', '', text)
+    text = re.sub(r'(?i)текст:\s*', '', text)
+    
     return text.strip()
 
+def filter_and_add(text):
+    """Фильтрация и добавление очищенной цитаты в коллекцию"""
+    cleaned = clean_quote(text)
+    
+    # Проверка на адекватную длину, отсутствие ссылок и хештегов
+    if 10 < len(cleaned) < 250 and "http" not in cleaned and "vk.com" not in cleaned and "#" not in cleaned:
+        # Убеждаемся, что мы не сохранили саму подпись Джейсона как цитату
+        if not re.fullmatch(r'(?i)(джейсон\s+)?(ст[эе]тх[эе]м|стэйтем|statham)', cleaned):
+            quotes_collection.add(cleaned)
+            return True
+    return False
+
 def scrape_citaty_info():
-    """Парсинг сайта citaty.info (чистый python без bs4)"""
     print("Парсинг citaty.info...")
     url = "https://citaty.info/selection/citaty-stethema"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
-            
-            # На этом сайте цитаты обычно в тегах <p>
             paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
-            
             for p in paragraphs:
-                text = clean_quote(p)
-                # Фильтруем слишком длинные абзацы и короткие
-                if 10 < len(text) < 150 and not text.startswith(('Цитаты Стетхема', 'Часто цитаты', 'Все эти мемные')):
-                    quotes_collection.add(text)
+                if not p.startswith(('Цитаты Стетхема', 'Часто цитаты', 'Все эти мемные')):
+                    filter_and_add(p)
     except Exception as e:
         print(f"Ошибка при парсинге citaty.info: {e}")
 
 def scrape_reddit_json():
-    """Парсинг Reddit через публичный JSON API"""
     print("Парсинг Reddit (r/rusAskReddit)...")
     url = "https://www.reddit.com/r/rusAskReddit/comments/16omboo/.json"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
-            
-        # Обход дерева комментариев
+        
         def extract_comments(comment_list):
             for item in comment_list:
-                if item['kind'] == 't1': # t1 = comment
+                if item['kind'] == 't1':
                     body = item['data'].get('body', '')
-                    # Разбиваем на строки
                     for line in body.split('\n'):
-                        cleaned = clean_quote(line)
-                        if 10 < len(cleaned) < 150 and "http" not in cleaned and "deleted" not in cleaned:
-                            quotes_collection.add(cleaned)
-                    
-                    # Рекурсивно обходим ответы
+                        if "deleted" not in line:
+                            filter_and_add(line)
                     replies = item['data'].get('replies')
                     if isinstance(replies, dict) and 'data' in replies:
                         extract_comments(replies['data'].get('children', []))
                         
-        # Первый элемент - сам пост, второй - комментарии
         if len(data) > 1 and 'data' in data[1]:
             extract_comments(data[1]['data'].get('children', []))
-            
     except Exception as e:
         print(f"Ошибка при парсинге Reddit: {e}")
 
-def scrape_vk():
-    """Парсинг ВКонтакте по API"""
-    print("Парсинг VK...")
+def scrape_vk_article():
+    print("Парсинг VK Статьи (Лонгрид)...")
+    url = "https://vk.com/@430405572-luchshie-citaty-dzheisona-stethema-101-citata"
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
+            count = 0
+            for p in paragraphs:
+                # В статье цитаты обычно нумеруются
+                p = re.sub(r'^\d+\.\s*', '', p)
+                if filter_and_add(p):
+                    count += 1
+            print(f"Из статьи успешно добавлено {count} цитат.")
+    except Exception as e:
+        print(f"Ошибка парсинга статьи: {e}")
+
+def scrape_vk_wall():
+    print("Парсинг VK (Стены)...")
     vk_token = os.environ.get('VK_TOKEN')
     if not vk_token:
-        print("ВНИМАНИЕ: VK_TOKEN не найден в переменных окружения или .env файле. Пропускаем VK.")
+        print("ВНИМАНИЕ: VK_TOKEN не найден. Пропускаем VK API.")
         return
         
     vk_version = '5.131'
-    # Список коротких имен пабликов (можно дополнять)
-    domains = ['jason_statham46', 'public96954008', 'jason_stathams']
+    # Расширенный список групп по наводке
+    domains = [
+        'jason_statham46', 
+        'public96954008', 
+        'jason_stathams',
+        'dzheysonstetkhem', 
+        'club225142165', 
+        'mdk.jason.statham',
+        'textmeme', 
+        'txtmeme', 
+        'club48417552'
+    ]
     
     for domain in domains:
         print(f"Запрос постов из {domain}...")
-        # count=100 - максимум за 1 запрос к API
         url = f"https://api.vk.com/method/wall.get?domain={domain}&count=100&v={vk_version}&access_token={vk_token}"
+        
+        # Если это clubXXXX или publicXXXX, метод wall.get с параметром domain иногда тоже срабатывает, 
+        # но безопаснее передавать owner_id для таких случаев. Для простоты пока попробуем domain,
+        # так как VK API умный и резолвит clubXXXX в domain.
+        if domain.startswith(('club', 'public')):
+            owner_id = "-" + re.sub(r'\D', '', domain)
+            url = f"https://api.vk.com/method/wall.get?owner_id={owner_id}&count=100&v={vk_version}&access_token={vk_token}"
+
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=10) as response:
@@ -130,32 +172,72 @@ def scrape_vk():
             added_count = 0
             for item in items:
                 text = item.get('text', '')
-                if not text:
+                if not text: continue
+                
+                # Строгий фильтр: пропускаем посты без упоминания Стетхема
+                if not is_statham_quote(text):
                     continue
-                # Разбиваем пост на строки, так как в одном посте может быть несколько мыслей, 
-                # либо мусор внизу
-                for line in text.split('\n'):
-                    cleaned = clean_quote(line)
-                    # Фильтруем ссылки, хэштеги и мусор
-                    if (10 < len(cleaned) < 200 and 
-                        "http" not in cleaned and 
-                        "vk.com" not in cleaned and 
-                        "#" not in cleaned and
-                        not cleaned.startswith('[')):
-                        quotes_collection.add(cleaned)
+                
+                # Некоторые паблики пишут подборки через пустую строку
+                blocks = re.split(r'\n\s*\n', text)
+                for block in blocks:
+                    if filter_and_add(block):
                         added_count += 1
-            print(f"Из {domain} успешно обработано постов. Найдено потенциальных цитат: {added_count}")
-            time.sleep(1.5) # Задержка между запросами по лимитам ВК (3 запроса в секунду макс)
+                        
+            print(f"Из {domain} успешно добавлено: {added_count}")
+            time.sleep(0.5)
         except Exception as e:
             print(f"Ошибка при парсинге VK ({domain}): {e}")
 
-def save_to_json():
-    """Сохранение результатов в JSON файл"""
-    result_list = []
-    # Фильтрация короткого мусора
-    valid_quotes = [q for q in quotes_collection if len(q) > 10 and not q.startswith('[')]
+def scrape_vk_board():
+    print("Парсинг VK (Обсуждения)...")
+    vk_token = os.environ.get('VK_TOKEN')
+    if not vk_token: return
+    vk_version = '5.131'
     
-    for i, quote in enumerate(sorted(list(valid_quotes)), 1):
+    # ID групп для парсинга обсуждений (jason_statham46 -> 31835783, club48417552 -> 48417552)
+    # Знак минуса для group_id в board.getTopics не нужен
+    group_ids = [31835783, 48417552]
+    
+    for gid in group_ids:
+        print(f"Запрос обсуждений для группы {gid}...")
+        try:
+            url_topics = f"https://api.vk.com/method/board.getTopics?group_id={gid}&count=10&v={vk_version}&access_token={vk_token}"
+            req = urllib.request.Request(url_topics, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                topics_data = json.loads(response.read().decode('utf-8'))
+                
+            topics = topics_data.get('response', {}).get('items', [])
+            for topic in topics:
+                title = topic.get('title', '').lower()
+                # Ищем темы, где делятся цитатами
+                if 'цитат' not in title and 'фраз' not in title and 'стетх' not in title:
+                    continue
+                    
+                topic_id = topic.get('id')
+                url_comments = f"https://api.vk.com/method/board.getComments?group_id={gid}&topic_id={topic_id}&count=100&v={vk_version}&access_token={vk_token}"
+                req_comm = urllib.request.Request(url_comments, headers=HEADERS)
+                with urllib.request.urlopen(req_comm, timeout=10) as response_comm:
+                    comments_data = json.loads(response_comm.read().decode('utf-8'))
+                    
+                comments = comments_data.get('response', {}).get('items', [])
+                added_count = 0
+                for comment in comments:
+                    text = comment.get('text', '')
+                    if not text: continue
+                    # В комментах обычно по одной цитате
+                    for line in text.split('\n'):
+                        if filter_and_add(line):
+                            added_count += 1
+                print(f"Из темы '{title}' добавлено {added_count} цитат.")
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка парсинга обсуждений для группы {gid}: {e}")
+
+def save_to_json():
+    result_list = []
+    # Сортируем для стабильности git diff
+    for i, quote in enumerate(sorted(list(quotes_collection)), 1):
         result_list.append({
             "id": i,
             "text": quote,
@@ -165,17 +247,18 @@ def save_to_json():
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(result_list, f, ensure_ascii=False, indent=4)
     
-    print(f"\nУспешно собрано {len(result_list)} уникальных цитат (с учетом старых и новых).")
+    print(f"\nУспешно собрано {len(result_list)} уникальных, чистых цитат.")
     print(f"Данные сохранены в файл: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
-    print("Запуск комбайна по сбору цитат...")
+    print("Запуск продвинутого комбайна по сбору цитат...")
     load_existing()
+    
     scrape_citaty_info()
-    time.sleep(1)
     scrape_reddit_json()
-    time.sleep(1)
-    scrape_vk()
+    scrape_vk_article()
+    scrape_vk_wall()
+    scrape_vk_board()
     
     save_to_json()
     print("Готово!")
